@@ -8,7 +8,7 @@ Features
   metal-rich, ferrimagnetic soils).
 - Frequency sweep 0.3–12 GHz with simple dispersive proxies for ε*(f), μ*(f).
 - Fresnel with magnetic media, RHCP incidence -> OC/SC coefficients -> CPR.
-- Facet incidence distribution + simple roughness-driven depolarization (toy).
+- Pluggable roughness models: toy, facet, iem-lite, none
 - Stability filter for CPR (avoid OC≈0 blow-ups), optional capping for visualization.
 - CSV outputs (raw + cleaned) and several summary plots.
 
@@ -17,11 +17,11 @@ Notes
 - Dispersion terms are proxies; swap in lab-fit curves when available.
 
 Run
-    python planetary_mu_epsilon_cpr_mc.py --outdir results
+    python full_test.py --outdir results
 
 Author: Dany Waller
 """
-
+# Imports:
 import argparse
 import os
 import numpy as np
@@ -51,14 +51,6 @@ def circular_components_from_rs_rp(rs, rp):
     sc = 0.5 * (rs - rp)
     return np.abs(oc)**2, np.abs(sc)**2
 
-def apply_roughness_depolarization(OC, SC, rms_slope):
-    # Toy: transfer fraction k of OC power into SC, k ~ 0.5 * slope^2
-    k = 0.5 * rms_slope**2
-    k = np.minimum(k, 0.8)
-    OCn = (1 - k) * OC
-    SCn = SC + k * OC
-    return OCn, SCn
-
 def nearest(arr, target):
     arr = np.asarray(arr)
     return arr[np.argmin(np.abs(arr - target))]
@@ -67,6 +59,7 @@ def nearest(arr, target):
 
 EPS0 = 8.854187817e-12
 MU0  = 4*np.pi*1e-7
+C0   = 299_792_458.0
 
 def eps_complex_dispersion(eps_real0, tan_e0, sigma, f, f0=1.0e9):
     """
@@ -95,7 +88,51 @@ def mu_complex_dispersion(mu_real0, tan_m0, f, f0=1.0e9, ferri=False, rng=None):
         mu_c = (mu_c.real) - 1j*(mu_c.real * (tan_m_f + 0.02*lorentz))
     return mu_c
 
-# ----------------------------- Main MC ------------------------------
+# -------------------------- Roughness models -------------------------
+
+def roughness_apply(OC, SC, model, *, theta_rad, rms_slope,
+                    freq_Hz, sigma_h_m, dihedral_k,
+                    rng, use_random_sigma_h=False, sigma_h_range=(0.003, 0.03)):
+    """
+    Returns (OCr, SCr) given chosen roughness model.
+
+    Models:
+      - 'none'   : return OC, SC as-is
+      - 'facet'  : no extra OC->SC transfer; facet slopes already sampled
+      - 'simple'    : k = 0.5 * rms_slope^2; transfer k*OC to SC
+      - 'iem-lite': F = exp(-(4π σh cosθ / λ)^2); transfer (1-F)*OC to SC + dihedral term
+    if model == "none" or model == "facet":
+        return OC, SC
+
+    if model == "simple":
+        k = 0.5 * np.square(rms_slope)
+        k = np.minimum(k, 0.8)
+        OCn = (1 - k) * OC
+        SCn = SC + k * OC
+        return OCn, SCn
+
+    if model == "iem-lite":
+        lam = C0 / freq_Hz
+        if use_random_sigma_h:
+            sigma_h = rng.uniform(sigma_h_range[0], sigma_h_range[1], size=OC.shape)
+        else:
+            sigma_h = sigma_h_m
+
+        # Smooth-surface power reduction (scalar), classic exp(-(4πσh cosθ / λ)^2)
+        red = np.exp(-np.square(4*np.pi*sigma_h*np.cos(theta_rad)/lam))
+        # Transfer a fraction (1 - red) of OC into SC (single-bounce depolarization)
+        trans = np.clip(1.0 - red, 0.0, 0.95)
+        OC1 = (1 - trans) * OC
+        SC1 = SC + trans * OC
+
+        # Add a simple dihedral boost scaling with sin^2(theta)
+        SC2 = SC1 + dihedral_k * np.square(np.sin(theta_rad)) * OC1
+        OC2 = OC1 * (1 - 0.25*dihedral_k)  # tiny energy bookkeeping
+        return OC2, SC2
+
+    raise ValueError(f"Unknown roughness model: {model}")
+
+# ----------------------------- Materials -----------------------------
 
 MATERIAL_CLASSES = {
     "Basaltic rock": {
@@ -146,15 +183,17 @@ MATERIAL_CLASSES = {
         "tan_m": (5e-4, 1e-2),
         "ferrimag": False,
     },
-    "Ferrimagnetic soil (Fe-oxide/npFe)": {
+    "Ferrimagnetic soil": {
         "eps_real": (4.0, 9.0),
         "tan_e": (2e-3, 3e-2),
         "sigma": (0.0, 5e-3),
         "mu_real": (1.05, 1.50),
         "tan_m": (1e-3, 2e-2),
-        "ferrimag": True,
+        "ferrimag": True, #  (Fe-oxide/npFe)
     },
 }
+
+# ----------------------------- CLI & Main ----------------------------
 
 def build_arguments():
     p = argparse.ArgumentParser(description="Monte-Carlo μ–ε tradeoffs in CPR/OC/SC with frequency dependence.")
@@ -164,10 +203,24 @@ def build_arguments():
     p.add_argument("--nf", type=int, default=100, help="Number of frequency samples.")
     p.add_argument("--seed", type=int, default=7, help="Random seed.")
     p.add_argument("--oc_min", type=float, default=1e-6, help="OC floor for stable CPR.")
-    p.add_argument("--cpr_cap", type=float, default=5.0, help="Visualization cap for CPR (<=0 disables capping).")
+    p.add_argument("--cpr_cap", type=float, default=10.0, help="Visualization cap for CPR (<=0 disables capping).")
     p.add_argument("--outdir", type=str, default=".", help="Output directory for CSVs and plots.")
     p.add_argument("--no_plots", action="store_true", help="Skip plotting (still writes CSVs).")
+
+    # Roughness control
+    p.add_argument("--roughness-model", type=str, default="none",
+                   choices=["simple", "facet", "iem-lite", "none"],
+                   help="Roughness/depole model.")
+    p.add_argument("--sigma-h-m", type=float, default=0.01,
+                   help="IEM-lite RMS height σh in meters (used if not randomized).")
+    p.add_argument("--dihedral-k", type=float, default=0.15,
+                   help="IEM-lite dihedral fraction (0–0.5 is reasonable).")
+    p.add_argument("--use-random-sigma-h", action="store_true",
+                   help="Randomize σh per sample in IEM-lite.")
+    p.add_argument("--sigma-h-range", type=float, nargs=2, default=[0.003, 0.03],
+                   help="Range for randomized σh (meters) in IEM-lite.")
     return p.parse_args()
+
 
 def main():
     args = build_arguments()
@@ -180,8 +233,13 @@ def main():
 
     # Angle & roughness distributions (shared per class)
     theta_deg = np.clip(rng.normal(35.0, 12.0, size=args.n_per_class), 0.0, 80.0)
-    cos_theta = np.cos(np.deg2rad(theta_deg))
+    theta_rad = np.deg2rad(theta_deg)
+    cos_theta = np.cos(theta_rad)
     rms_slope = np.clip(rng.normal(0.25, 0.12, size=args.n_per_class), 0.0, 0.8)
+
+    if args.roughness_model == "none":
+        theta_rad = np.zeros_like(theta_rad)
+        cos_theta = np.ones_like(cos_theta)
 
     # Medium 1 (vacuum, relative units)
     eps1 = 1.0 + 0j
@@ -219,7 +277,19 @@ def main():
             rs, rp = fresnel_coeffs_magnetic(eta1, eta2, n1, n2, cos_theta)
             OC, SC = circular_components_from_rs_rp(rs, rp)
 
-            OCr, SCr = apply_roughness_depolarization(OC, SC, rms_slope)
+            # --- Apply chosen roughness model (frequency-aware if needed) ---
+            OCr, SCr = roughness_apply(
+                OC, SC, args.roughness_model,
+                theta_rad=theta_rad,
+                rms_slope=rms_slope,
+                freq_Hz=f,
+                sigma_h_m=args.sigma_h_m,
+                dihedral_k=args.dihedral_k,
+                rng=rng,
+                use_random_sigma_h=args.use_random_sigma_h,
+                sigma_h_range=tuple(args.sigma_h_range),
+            )
+
             CPR = np.divide(SCr, OCr, out=np.full_like(SCr, np.nan), where=OCr > 1e-18)
 
             block = pd.DataFrame({
@@ -244,8 +314,17 @@ def main():
 
     df = pd.concat(records, ignore_index=True)
 
+    if args.roughness_model == 'none':
+        args.roughness_model = 'No Roughness Model'
+    elif args.roughness_model == 'simple':
+        args.roughness_model = 'Simple Roughness Model'
+    elif args.roughness_model == 'facet':
+        args.roughness_model = 'Facet-only Roughness Model'
+    elif args.roughness_model == 'iem-lite':
+        args.roughness_model = 'IEM-Lite Roughness Model'
+
     # Save raw
-    raw_csv = os.path.join(args.outdir, "planetary_mu_epsilon_cpr_freq_mc.csv")
+    raw_csv = os.path.join(args.outdir, f"planetary_mu_epsilon_cpr_{str(args.roughness_model).lower().replace(' ', '_')}_RAW.csv")
     df.to_csv(raw_csv, index=False)
     print(f"Wrote raw samples: {raw_csv}  (rows={len(df):,})")
 
@@ -254,16 +333,14 @@ def main():
     if args.cpr_cap and args.cpr_cap > 0:
         df["CPR_stable"] = np.where(df["CPR_stable"] <= args.cpr_cap, df["CPR_stable"], args.cpr_cap)
 
-    clean_csv = os.path.join(args.outdir, "planetary_mu_epsilon_cpr_freq_mc_CLEAN.csv")
+    clean_csv = os.path.join(args.outdir, f"planetary_mu_epsilon_cpr_{str(args.roughness_model).lower().replace(' ', '_')}_CLEAN.csv")
     df.to_csv(clean_csv, index=False)
     print(f"Wrote cleaned samples: {clean_csv}")
 
     if args.no_plots:
         return
 
-    # ----------------------------- Plots -----------------------------
-
-    # Aggregations
+    # ----------- Plots -----------
     g = df.groupby(["class", "freq_Hz"], as_index=False).agg(
         CPR_med=("CPR_stable", "median"),
         OC_med=("OC", "median"),
@@ -278,11 +355,11 @@ def main():
         plt.plot(d["freq_Hz"]/1e9, d["CPR_med"], marker="o", label=cls)
     plt.xlabel("Frequency (GHz)")
     plt.ylabel("Median CPR (stable)")
-    plt.title("Median CPR vs Frequency by Material Class")
-    plt.legend()
+    plt.title(f"Median CPR vs Frequency by Material Class\n{args.roughness_model}")
+    plt.legend(fontsize="small", ncol=3, loc='upper center', bbox_to_anchor=(0.5, -0.2))
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(args.outdir, "CPR_vs_freq_by_class.png"), dpi=180)
+    plt.savefig(os.path.join(args.outdir, f"CPR_vs_freq_{str(args.roughness_model).lower().replace(' ', '_')}.png"), dpi=180)
 
     # 2) Median OC vs frequency
     plt.figure()
@@ -291,11 +368,11 @@ def main():
         plt.plot(d["freq_Hz"]/1e9, d["OC_med"], marker="o", label=cls)
     plt.xlabel("Frequency (GHz)")
     plt.ylabel("Median OC")
-    plt.title("Median OC vs Frequency by Material Class")
-    plt.legend()
+    plt.title(f"Median OC vs Frequency\n{args.roughness_model}")
+    plt.legend(fontsize="small", ncol=3, loc='upper center', bbox_to_anchor=(0.5, -0.2))
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(args.outdir, "OC_vs_freq_by_class.png"), dpi=180)
+    plt.savefig(os.path.join(args.outdir, f"OC_vs_freq_{str(args.roughness_model).lower().replace(' ', '_')}.png"), dpi=180)
 
     # 3) Median SC vs frequency
     plt.figure()
@@ -304,13 +381,13 @@ def main():
         plt.plot(d["freq_Hz"]/1e9, d["SC_med"], marker="o", label=cls)
     plt.xlabel("Frequency (GHz)")
     plt.ylabel("Median SC")
-    plt.title("Median SC vs Frequency by Material Class")
-    plt.legend()
+    plt.title(f"Median SC vs Frequency\n{args.roughness_model}")
+    plt.legend(fontsize="small", ncol=3, loc='upper center', bbox_to_anchor=(0.5, -0.2))
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(args.outdir, "SC_vs_freq_by_class.png"), dpi=180)
+    plt.savefig(os.path.join(args.outdir, f"SC_vs_freq_{str(args.roughness_model).lower().replace(' ', '_')}.png"), dpi=180)
 
-    # 4) CPR heatmaps across (μ', ε') at ~0.85, 2.38, 9.6 GHz (use nearest frequencies)
+    # 4) CPR heatmaps across (μ', ε') at ~0.85, 2.37, 7,14 GHz (use nearest frequencies)
     def median_cpr_grid(dfin, f_Hz, nbins=28):
         sub = dfin[np.isclose(dfin["freq_Hz"], f_Hz)]
         if sub.empty:
@@ -334,7 +411,7 @@ def main():
         return mu_cent, eps_cent, grid
 
     unique_freqs = np.sort(df["freq_Hz"].unique())
-    for fGHz in [0.85, 2.38, 9.6]:
+    for fGHz in [0.85, 2.37, 7.14]:
         f_sel = nearest(unique_freqs, fGHz*1e9)
         mu_cent, eps_cent, grid = median_cpr_grid(df, f_sel, nbins=28)
         if grid is None:
@@ -344,11 +421,14 @@ def main():
         plt.imshow(np.flipud(grid), aspect="auto", extent=extent, origin="lower")
         plt.xlabel("ε' (real permittivity)")
         plt.ylabel("μ' (real permeability)")
-        plt.title(f"Median CPR (stable) across (μ', ε') at ~{f_sel/1e9:.2f} GHz")
+        plt.title(f"Median CPR (stable) across (μ', ε') at ~{f_sel/1e9:.2f} GHz\n{args.roughness_model}")
         cbar = plt.colorbar()
-        cbar.set_label("Median CPR" + (f" (capped at {args.cpr_cap:g})" if args.cpr_cap > 0 else ""))
+        lab = "Median CPR"
+        if args.cpr_cap and args.cpr_cap > 0:
+            lab += f" (capped at {args.cpr_cap:g})"
+        cbar.set_label(lab)
         plt.tight_layout()
-        plt.savefig(os.path.join(args.outdir, f"CPR_heatmap_{f_sel/1e9:.2f}GHz.png"), dpi=180)
+        plt.savefig(os.path.join(args.outdir, f"CPR_heatmap_{str(args.roughness_model).lower().replace(' ', '_')}_{f_sel/1e9:.2f}GHz.png"), dpi=180)
 
     # 5) S-band scatter CPR vs μ' (marker size ~ ε')
     s_freq = nearest(unique_freqs, 2.38e9)
@@ -359,10 +439,10 @@ def main():
     plt.scatter(sband["mu2_real"], sband["CPR_stable"], s=ms, alpha=0.25)
     plt.xlabel("μ' (~S-band)")
     plt.ylabel("CPR (stable)")
-    plt.title(f"CPR vs μ' at ~{s_freq/1e9:.2f} GHz (marker size ~ ε')")
+    plt.title(f"CPR vs μ' at ~{s_freq/1e9:.2f} GHz\n{args.roughness_model} (marker size ~ ε')")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(args.outdir, "CPR_vs_mu_Sband.png"), dpi=180)
+    plt.savefig(os.path.join(args.outdir, f"CPR_vs_mu_Sband_{str(args.roughness_model).lower().replace(' ', '_')}.png"), dpi=180)
 
     print(f"Plots saved to: {os.path.abspath(args.outdir)}")
 
